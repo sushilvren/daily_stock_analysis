@@ -12,16 +12,19 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
+from strategy import DEFAULT_HOLDINGS, DEFAULT_WATCH, market_context, rank_codes, score_row
+
 APP_NAME = "A-Stock Market Data Gateway"
 DEFAULT_CACHE_SECONDS = float(os.getenv("CACHE_SECONDS", "4"))
 SH_TZ = ZoneInfo("Asia/Shanghai")
 
 app = FastAPI(
     title=APP_NAME,
-    version="0.1.0",
+    version="0.2.0",
     description=(
-        "Read-only A-share market-data gateway. Every response includes source and fetch timestamp. "
-        "The fallback provider is AkShare and MUST NOT be treated as exchange Level-2 or guaranteed real-time data."
+        "Read-only A-share market-data gateway plus explainable intraday scoring. "
+        "Every response includes source and fetch timestamp. The fallback provider is AkShare and "
+        "MUST NOT be treated as exchange Level-2 or guaranteed real-time data."
     ),
 )
 app.add_middleware(
@@ -98,7 +101,6 @@ def _load_spot() -> tuple[pd.DataFrame, str]:
             return fresh, fetched_at
         except Exception as exc:
             _cache["error"] = repr(exc)
-            # If the upstream fails, return a recent cached snapshot for up to 120 seconds.
             if df is not None and now - float(_cache["ts"]) < 120:
                 return df, str(_cache["fetched_at"])
             raise
@@ -157,8 +159,10 @@ def root() -> dict[str, Any]:
     return {
         "service": APP_NAME,
         "status": "ok",
+        "version": "0.2.0",
         "docs": "/docs",
         "health": "/health",
+        "portfolio": "/portfolio/default",
         "warning": "Fallback data is not guaranteed exchange-real-time or Level-2.",
     }
 
@@ -236,6 +240,62 @@ def breadth() -> dict[str, Any]:
         "total_turnover": _safe_value(turnover.sum()),
     }
     return {"meta": _meta(fetched_at), "data": data}
+
+
+@app.get("/market/context")
+def market_state() -> dict[str, Any]:
+    try:
+        df, fetched_at = _load_spot()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"market provider unavailable: {exc}")
+    return {"meta": _meta(fetched_at), "data": market_context(df)}
+
+
+@app.get("/signal/{code}")
+def signal(code: str) -> dict[str, Any]:
+    c = _normalise_code(code)
+    try:
+        df, fetched_at = _load_spot()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"market provider unavailable: {exc}")
+    hit = df[df["代码"] == c]
+    if hit.empty:
+        raise HTTPException(status_code=404, detail=f"code not found: {c}")
+    row = hit.iloc[0]
+    context = market_context(df)
+    return {
+        "meta": _meta(fetched_at),
+        "market": context,
+        "quote": _row_to_quote(row),
+        "signal": score_row(row, context).as_dict(),
+        "model_note": "Explainable heuristic v0.2; not a guaranteed prediction model.",
+    }
+
+
+@app.get("/portfolio/default")
+def default_portfolio() -> dict[str, Any]:
+    try:
+        df, fetched_at = _load_spot()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"market provider unavailable: {exc}")
+    return {
+        "meta": _meta(fetched_at),
+        "market": market_context(df),
+        "holdings": rank_codes(df, DEFAULT_HOLDINGS),
+    }
+
+
+@app.get("/watch/default")
+def default_watch() -> dict[str, Any]:
+    try:
+        df, fetched_at = _load_spot()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"market provider unavailable: {exc}")
+    return {
+        "meta": _meta(fetched_at),
+        "market": market_context(df),
+        "ranked": rank_codes(df, DEFAULT_WATCH),
+    }
 
 
 @app.get("/scan/movers")
