@@ -12,9 +12,11 @@ from fastapi import HTTPException, Query
 
 import app as base_app
 from ifind_client import IFIND
+from microstructure import bars as tdx_bars, quote_depth as tdx_quote_depth, transactions as tdx_transactions
 from providers import load_spot as base_load_spot, provider_meta
 from scanner import opportunity_scan, theme_strength
 from strategy import DEFAULT_HOLDINGS, market_context, rank_codes
+from swing_models import score_daily_bars
 from themes import THEMES
 
 FOCUS_CODES = sorted(set(DEFAULT_HOLDINGS + [c for cfg in THEMES.values() for c in cfg.get("codes", [])]))
@@ -126,6 +128,57 @@ def snapshot() -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"market provider unavailable: {exc}")
     return {"meta": _meta(fetched_at), **_snapshot_payload(df)}
+
+
+@app.get("/micro/quote/{code}")
+def micro_quote(code: str) -> dict[str, Any]:
+    try:
+        data = tdx_quote_depth(code)
+        data["warning"] = "Public TongdaXin feed; useful for microstructure confirmation but not licensed Level-2."
+        return data
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"TongdaXin quote unavailable: {exc}")
+
+
+@app.get("/micro/ticks/{code}")
+def micro_ticks(
+    code: str,
+    start: int = Query(0, ge=0),
+    count: int = Query(100, ge=1, le=2000),
+) -> dict[str, Any]:
+    try:
+        data = tdx_transactions(code, start=start, count=count)
+        data["warning"] = "Public transaction feed; field semantics depend on upstream and are not exchange Level-2 attribution."
+        return data
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"TongdaXin transaction feed unavailable: {exc}")
+
+
+@app.get("/micro/bars/{code}")
+def micro_bars(
+    code: str,
+    category: int = Query(0, description="0=5m,1=15m,2=30m,3=1h,9=daily"),
+    count: int = Query(120, ge=10, le=800),
+) -> dict[str, Any]:
+    try:
+        return tdx_bars(code, category=category, count=count)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"TongdaXin bars unavailable: {exc}")
+
+
+@app.get("/strategy/swing/{code}")
+def swing_strategy(code: str, count: int = Query(180, ge=60, le=500)) -> dict[str, Any]:
+    try:
+        raw = tdx_bars(code, category=9, count=count)
+        model = score_daily_bars(raw.get("data", []))
+        return {
+            "source": raw.get("source"),
+            "code": raw.get("code"),
+            "model": model,
+            "model_inputs": "daily OHLCV; breakout, MA alignment, volume confirmation, consolidation, shakeout and trend momentum",
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"swing strategy unavailable: {exc}")
 
 
 def _is_active_session(session: str) -> bool:
