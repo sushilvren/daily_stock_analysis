@@ -18,6 +18,7 @@ from scanner import opportunity_scan, theme_strength
 from strategy import DEFAULT_HOLDINGS, market_context, rank_codes
 from swing_models import score_daily_bars
 from themes import THEMES
+from upstream_dsa_integration import auto_weights, calibrate_confidence, market_phase, portfolio_risk
 
 FOCUS_CODES = sorted(set(DEFAULT_HOLDINGS + [c for cfg in THEMES.values() for c in cfg.get("codes", [])]))
 _IFIND_LAST_APPLIED = 0
@@ -90,8 +91,10 @@ _MONITOR_STARTED = False
 
 
 def _snapshot_payload(df) -> dict[str, Any]:
+    context = market_context(df)
     return {
-        "market": market_context(df),
+        "market": context,
+        "market_phase": market_phase(context),
         "themes": theme_strength(df, THEMES),
         "holdings": rank_codes(df, DEFAULT_HOLDINGS),
         "opportunities": opportunity_scan(df, limit=10),
@@ -113,9 +116,11 @@ def scan_opportunities(limit: int = Query(20, ge=1, le=100)) -> dict[str, Any]:
         df, fetched_at = _load_spot()
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"market provider unavailable: {exc}")
+    context = market_context(df)
     return {
         "meta": _meta(fetched_at),
-        "market": market_context(df),
+        "market": context,
+        "market_phase": market_phase(context),
         "data": opportunity_scan(df, limit=limit),
         "note": "Heuristic candidate scan; candidates require sector/news/risk confirmation before any trade decision.",
     }
@@ -128,6 +133,16 @@ def snapshot() -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"market provider unavailable: {exc}")
     return {"meta": _meta(fetched_at), **_snapshot_payload(df)}
+
+
+@app.get("/market/phase")
+def market_phase_endpoint() -> dict[str, Any]:
+    try:
+        df, fetched_at = _load_spot()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"market provider unavailable: {exc}")
+    context = market_context(df)
+    return {"meta": _meta(fetched_at), "market": context, "phase": market_phase(context)}
 
 
 @app.get("/micro/quote/{code}")
@@ -179,6 +194,43 @@ def swing_strategy(code: str, count: int = Query(180, ge=60, le=500)) -> dict[st
         }
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"swing strategy unavailable: {exc}")
+
+
+@app.get("/model/calibrate")
+def model_calibrate(
+    raw_confidence: float = Query(..., ge=0, le=1),
+    samples: int = Query(0, ge=0),
+    hit_rate: float | None = Query(None, ge=0, le=1),
+) -> dict[str, Any]:
+    return {
+        "raw_confidence": raw_confidence,
+        "samples": samples,
+        "hit_rate": hit_rate,
+        "calibrated_confidence": calibrate_confidence(raw_confidence, samples, hit_rate),
+        "note": "Calibration is conservative until enough historical samples accumulate.",
+    }
+
+
+@app.get("/model/auto-weights")
+def model_auto_weights(stats_json: str = Query(..., description='JSON list: [{"name":"weak_to_strong","samples":40,"wins":25,"avg_return":2.1}]')) -> dict[str, Any]:
+    try:
+        stats = json.loads(stats_json)
+        if not isinstance(stats, list):
+            raise ValueError("stats_json must be a JSON list")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid stats_json: {exc}")
+    return {"weights": auto_weights(stats), "stats": stats}
+
+
+@app.get("/portfolio/risk")
+def portfolio_risk_endpoint(positions_json: str = Query(..., description='JSON list with symbol, weight and sector')) -> dict[str, Any]:
+    try:
+        positions = json.loads(positions_json)
+        if not isinstance(positions, list):
+            raise ValueError("positions_json must be a JSON list")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid positions_json: {exc}")
+    return portfolio_risk(positions)
 
 
 def _is_active_session(session: str) -> bool:
