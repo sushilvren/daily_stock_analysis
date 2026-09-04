@@ -9,10 +9,19 @@ from typing import Any
 
 from fastapi import HTTPException, Query
 
-from app import app, _load_spot, _meta
+import app as base_app
+from providers import load_spot, provider_meta
 from scanner import opportunity_scan, theme_strength
 from strategy import DEFAULT_HOLDINGS, market_context, rank_codes
 from themes import THEMES
+
+# Patch the base route module so existing /quote, /portfolio, /market endpoints use
+# the same hybrid provider as the monitor/scanners.
+base_app._load_spot = load_spot
+base_app._meta = provider_meta
+app = base_app.app
+_load_spot = load_spot
+_meta = provider_meta
 
 log = logging.getLogger("market_monitor")
 _MONITOR_STARTED = False
@@ -72,8 +81,8 @@ def _monitor_loop() -> None:
             df, fetched_at = _load_spot()
             meta = _meta(fetched_at)
             payload = {"meta": meta, **_snapshot_payload(df)}
-            # One compact machine-readable line lets ChatGPT retrieve the newest snapshot
-            # through Railway logs even before a custom MCP/app is connected.
+            # Compact machine-readable line: ChatGPT can retrieve the newest snapshot
+            # via Railway logs before a custom MCP/app connection is available.
             log.warning("MARKET_SNAPSHOT %s", json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str))
             sleep_for = interval if _is_active_session(meta["market_session"]) else closed_interval
         except Exception as exc:
