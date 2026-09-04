@@ -7,21 +7,81 @@ import threading
 import time
 from typing import Any
 
+import pandas as pd
 from fastapi import HTTPException, Query
 
 import app as base_app
-from providers import load_spot, provider_meta
+from ifind_client import IFIND
+from providers import load_spot as base_load_spot, provider_meta
 from scanner import opportunity_scan, theme_strength
 from strategy import DEFAULT_HOLDINGS, market_context, rank_codes
 from themes import THEMES
 
-# Patch the base route module so existing /quote, /portfolio, /market endpoints use
-# the same hybrid provider as the monitor/scanners.
+FOCUS_CODES = sorted(set(DEFAULT_HOLDINGS + [c for cfg in THEMES.values() for c in cfg.get("codes", [])]))
+_IFIND_LAST_APPLIED = 0
+
+
+def _overlay_ifind(df: pd.DataFrame) -> pd.DataFrame:
+    global _IFIND_LAST_APPLIED
+    quotes = IFIND.safe_realtime(FOCUS_CODES)
+    if not quotes:
+        _IFIND_LAST_APPLIED = 0
+        return df
+    work = df.copy()
+    work["代码"] = work["代码"].astype(str).str.zfill(6)
+    idx_map = {str(code): idx for idx, code in zip(work.index, work["代码"])}
+    applied = 0
+    for code, q in quotes.items():
+        idx = idx_map.get(code)
+        if idx is None:
+            continue
+        mapping = {"latest": "最新价", "open": "今开", "high": "最高", "low": "最低"}
+        for src, dst in mapping.items():
+            value = q.get(src)
+            try:
+                if value is not None:
+                    work.at[idx, dst] = float(value)
+            except Exception:
+                pass
+        try:
+            last = float(work.at[idx, "最新价"])
+            prev = float(work.at[idx, "昨收"])
+            if prev > 0:
+                work.at[idx, "涨跌额"] = last - prev
+                work.at[idx, "涨跌幅"] = (last / prev - 1) * 100
+        except Exception:
+            pass
+        applied += 1
+    _IFIND_LAST_APPLIED = applied
+    return work
+
+
+def load_spot() -> tuple[pd.DataFrame, str]:
+    df, fetched_at = base_load_spot()
+    if IFIND.enabled:
+        df = _overlay_ifind(df)
+    return df, fetched_at
+
+
+def gateway_meta(fetched_at: str | None = None) -> dict[str, Any]:
+    meta = provider_meta(fetched_at)
+    meta.update({
+        "ifind_overlay_enabled": IFIND.enabled,
+        "ifind_focus_quotes_applied": _IFIND_LAST_APPLIED,
+        "ifind_provider_time": IFIND.last_provider_time,
+        "ifind_last_error": IFIND.last_error,
+    })
+    if _IFIND_LAST_APPLIED:
+        meta["source"] = f"{meta.get('source')} + iFinD focus overlay"
+    return meta
+
+
+# Patch base route module so all existing endpoints use the same provider layer.
 base_app._load_spot = load_spot
-base_app._meta = provider_meta
+base_app._meta = gateway_meta
 app = base_app.app
 _load_spot = load_spot
-_meta = provider_meta
+_meta = gateway_meta
 
 log = logging.getLogger("market_monitor")
 _MONITOR_STARTED = False
@@ -81,8 +141,6 @@ def _monitor_loop() -> None:
             df, fetched_at = _load_spot()
             meta = _meta(fetched_at)
             payload = {"meta": meta, **_snapshot_payload(df)}
-            # Compact machine-readable line: ChatGPT can retrieve the newest snapshot
-            # via Railway logs before a custom MCP/app connection is available.
             log.warning("MARKET_SNAPSHOT %s", json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str))
             sleep_for = interval if _is_active_session(meta["market_session"]) else closed_interval
         except Exception as exc:
