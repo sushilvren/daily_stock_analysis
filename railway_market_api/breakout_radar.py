@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -49,17 +50,19 @@ def _limit_threshold(board: str, name: str) -> float:
 class CapitalMemory:
     """Small rolling memory for pre-breakout activity.
 
-    The market monitor calls the radar repeatedly. Intraday observations are folded into
-    one record per trading date, preserving the day's maximum turnover/activity. The
-    default file is best-effort persistence across process restarts on the same Railway
-    container; callers should not treat it as durable storage.
+    Intraday observations are folded into one record per trading date, preserving the
+    day's maximum turnover/activity. The default file is best-effort persistence across
+    process restarts on the same Railway container; callers should not treat it as a
+    durable database.
     """
 
-    def __init__(self, path: Path = _MEMORY_PATH, keep_days: int = 10) -> None:
+    def __init__(self, path: Path = _MEMORY_PATH, keep_days: int = 10, observe_interval: int = 300) -> None:
         self.path = path
         self.keep_days = max(5, keep_days)
+        self.observe_interval = max(60, observe_interval)
         self.lock = threading.RLock()
         self.data: dict[str, dict[str, dict[str, Any]]] = {}
+        self.last_observe_ts = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -80,9 +83,14 @@ class CapitalMemory:
         except Exception:
             pass
 
-    def observe(self, df: pd.DataFrame) -> None:
+    def observe(self, df: pd.DataFrame, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self.last_observe_ts < self.observe_interval:
+            return
         today = datetime.now(SH_TZ).date().isoformat()
         with self.lock:
+            if not force and now - self.last_observe_ts < self.observe_interval:
+                return
             for _, r in df.iterrows():
                 code = str(r.get("代码", "")).zfill(6)
                 if not code or code == "000000":
@@ -112,6 +120,7 @@ class CapitalMemory:
                 days[today] = rec
                 for d in sorted(days.keys())[:-self.keep_days]:
                     days.pop(d, None)
+            self.last_observe_ts = now
             self._save()
 
     def summary(self, code: str, exclude_today: bool = True) -> dict[str, Any]:
@@ -194,7 +203,6 @@ def breakout_radar(df: pd.DataFrame, limit: int = 20, mode: str = "close") -> li
         tags: list[str] = []
         risks: list[str] = []
 
-        # 1) Elasticity: BSE / growth boards and smaller float caps get priority.
         if board == "bse":
             score += 10
             tags.append("北交所高弹性")
@@ -216,7 +224,6 @@ def breakout_radar(df: pd.DataFrame, limit: int = 20, mode: str = "close") -> li
         else:
             cap_yi = None
 
-        # 2) Current preheat. Reward activity, but penalize already-climactic turnover.
         if 5 <= turnover_rate <= 22:
             score += 8
             tags.append("换手预热")
@@ -242,7 +249,6 @@ def breakout_radar(df: pd.DataFrame, limit: int = 20, mode: str = "close") -> li
         if turnover >= 150_000_000:
             score += 2
 
-        # 3) Constructive price structure: relative strength without being the obvious climax.
         if -1.5 <= pct <= 5.5 and rel >= 0.8:
             score += 7
             tags.append("强于市场")
@@ -257,7 +263,6 @@ def breakout_radar(df: pd.DataFrame, limit: int = 20, mode: str = "close") -> li
         if amp >= 4:
             score += 2
 
-        # 4) Capital memory: a previous hot day followed by cooling-off is the Vicky-style feature.
         if memory["hot_days"] >= 1:
             score += 8
             tags.append("近10日资金记忆")
@@ -270,12 +275,10 @@ def breakout_radar(df: pd.DataFrame, limit: int = 20, mode: str = "close") -> li
         if memory["hot_days"] >= 2:
             score += 3
 
-        # Cooling after an earlier hot day is preferred to consecutive acceleration.
         if memory["hot_days"] >= 1 and pct <= 4.5 and turnover_rate <= 28:
             score += 4
             tags.append("异动后未高潮")
 
-        # 5) Auction confirmation layer.
         if mode == "auction":
             if 0.5 <= gap <= 5 and rel >= 1:
                 score += 8
