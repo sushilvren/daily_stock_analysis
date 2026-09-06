@@ -50,10 +50,10 @@ class IFindClient:
         if c.endswith((".SH", ".SZ", ".BJ")):
             return c
         c = c.split(".")[0].replace("SH", "").replace("SZ", "").replace("BJ", "").zfill(6)
+        if c.startswith(("4", "8", "92")):
+            return f"{c}.BJ"
         if c.startswith(("6", "5", "9")):
             return f"{c}.SH"
-        if c.startswith(("4", "8")):
-            return f"{c}.BJ"
         return f"{c}.SZ"
 
     @staticmethod
